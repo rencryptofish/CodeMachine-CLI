@@ -1,6 +1,10 @@
 import { logTelemetry } from './logger.js';
-
-type EngineType = 'codex' | 'cursor' | 'claude';
+import type { EngineType } from '../../infra/engines/index.js';
+import { parseTelemetry as parseClaudeTelemetry } from '../../infra/engines/providers/claude/telemetryParser.js';
+import { parseTelemetry as parseCodexTelemetry } from '../../infra/engines/providers/codex/telemetryParser.js';
+import { parseTelemetry as parseOpenCodeTelemetry } from '../../infra/engines/providers/opencode/telemetryParser.js';
+import { parseTelemetry as parseCCRTelemetry } from '../../infra/engines/providers/ccr/telemetryParser.js';
+import { parseTelemetry as parseCursorTelemetry } from '../../infra/engines/providers/cursor/telemetryParser.js';
 
 interface CapturedTelemetry {
   duration?: number;
@@ -12,11 +16,29 @@ interface CapturedTelemetry {
   };
 }
 
+type TelemetryParser = (json: unknown) => CapturedTelemetry | null;
+
+/**
+ * Engine-specific telemetry parsers
+ */
+const telemetryParsers: Record<EngineType, TelemetryParser> = {
+  claude: parseClaudeTelemetry,
+  codex: parseCodexTelemetry,
+  opencode: parseOpenCodeTelemetry,
+  ccr: parseCCRTelemetry,
+  cursor: parseCursorTelemetry,
+};
+
 export interface TelemetryCapture {
   /**
    * Parses a streaming JSON line and captures telemetry data if present
    */
   captureFromStreamJson(line: string): void;
+
+  /**
+   * Gets the captured telemetry data
+   */
+  getCaptured(): CapturedTelemetry | null;
 
   /**
    * Logs the captured telemetry data to the telemetry log file
@@ -40,65 +62,34 @@ export function createTelemetryCapture(
       try {
         const json = JSON.parse(line);
 
-        // Codex format: look for turn.completed with usage
-        if (engine === 'codex') {
-          if (json.type === 'turn.completed' && json.usage) {
-            captured = {
-              tokens: {
-                input: json.usage.input_tokens,
-                output: json.usage.output_tokens,
-                cached: json.usage.cached_input_tokens,
-              },
-            };
-          }
-        }
-        // Cursor and Claude format: look for result type with full telemetry
-        else if (engine === 'cursor' || engine === 'claude') {
-          if (json.type === 'result' && json.usage) {
-            console.error('[TELEMETRY DEBUG] Captured telemetry:', {
-              duration: json.duration_ms,
-              cost: json.total_cost_usd,
-              input: json.usage.input_tokens,
-              output: json.usage.output_tokens,
-            });
-            captured = {
-              duration: json.duration_ms,
-              cost: json.total_cost_usd,
-              tokens: {
-                input: json.usage.input_tokens,
-                output: json.usage.output_tokens,
-              },
-            };
-          }
+        // Use engine-specific parser
+        const parser = telemetryParsers[engine];
+        const result = parser(json);
+        if (result) {
+          captured = result;
         }
       } catch {
         // Ignore JSON parse errors - not all lines will be valid JSON
       }
     },
 
-    logCapturedTelemetry(exitCode: number): void {
-      console.error('[TELEMETRY DEBUG] logCapturedTelemetry called', {
-        hasCaptured: !!captured,
-        hasTokens: !!captured?.tokens,
-        exitCode,
-        workingDir,
-      });
+    getCaptured(): CapturedTelemetry | null {
+      return captured;
+    },
 
+    logCapturedTelemetry(exitCode: number): void {
       if (!captured || !captured.tokens) {
-        console.error('[TELEMETRY DEBUG] No telemetry captured, skipping log');
         return;
       }
 
       // Validate that token values are actual numbers
       if (typeof captured.tokens.input !== 'number' || typeof captured.tokens.output !== 'number') {
-        console.error('[TELEMETRY DEBUG] Invalid token values:', captured.tokens);
         return;
       }
 
-      console.error('[TELEMETRY DEBUG] Writing telemetry to file...');
       logTelemetry({
         engine,
-        model: model || (engine === 'cursor' ? 'auto' : 'default'),
+        model: model || 'default',
         cost: captured.cost,
         duration: captured.duration,
         tokens: {

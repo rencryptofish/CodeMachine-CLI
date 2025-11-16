@@ -15,14 +15,19 @@ export interface TriggerModuleBehavior {
   triggerAgentId: string; // Agent ID to trigger
 }
 
-export type ModuleBehavior = LoopModuleBehavior | TriggerModuleBehavior;
+export interface CheckpointModuleBehavior {
+  type: 'checkpoint';
+  action: 'evaluate';
+}
+
+export type ModuleBehavior = LoopModuleBehavior | TriggerModuleBehavior | CheckpointModuleBehavior;
 
 export interface ModuleMetadata {
   id: string;
   behavior?: ModuleBehavior;
 }
 
-export interface WorkflowStep {
+export interface ModuleStep {
   type: 'module';
   agentId: string;
   agentName: string;
@@ -35,13 +40,27 @@ export interface WorkflowStep {
   notCompletedFallback?: string; // Agent ID to run if step is in notCompletedSteps
 }
 
+export interface UIStep {
+  type: 'ui';
+  text: string;
+}
+
+export type WorkflowStep = ModuleStep | UIStep;
+
+/**
+ * Type guard to check if a step is a ModuleStep
+ */
+export function isModuleStep(step: WorkflowStep): step is ModuleStep {
+  return step.type === 'module';
+}
+
 export interface WorkflowTemplate {
   name: string;
   steps: WorkflowStep[];
   subAgentIds?: string[];
 }
 
-export type ModuleName = WorkflowStep['agentId'];
+export type ModuleName = ModuleStep['agentId'];
 
 export interface RunWorkflowOptions {
   cwd?: string;

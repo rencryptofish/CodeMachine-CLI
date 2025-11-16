@@ -5,7 +5,7 @@ import { spawnProcess } from '../../../../process/spawn.js';
 import { buildCursorExecCommand } from './commands.js';
 import { metadata } from '../metadata.js';
 import { expandHomeDir } from '../../../../../shared/utils/index.js';
-import { logger } from '../../../../../shared/logging/index.js';
+import { formatThinking, formatCommand, formatResult, formatStatus } from '../../../../../shared/formatters/outputMarkers.js';
 
 export interface RunCursorOptions {
   prompt: string;
@@ -25,6 +25,12 @@ export interface RunCursorResult {
 
 const ANSI_ESCAPE_SEQUENCE = new RegExp(String.raw`\u001B\[[0-9;?]*[ -/]*[@-~]`, 'g');
 
+// Track tool names for associating with results
+const toolNameMap = new Map<string, string>();
+
+// Track accumulated thinking text for delta updates
+let accumulatedThinking = '';
+
 /**
  * Formats a Cursor stream-json line for display
  */
@@ -32,64 +38,43 @@ function formatStreamJsonLine(line: string): string | null {
   try {
     const json = JSON.parse(line);
 
+    // Handle system lifecycle events
+    if (json.type === 'system' && json.subtype === 'init') {
+      // Skip system init messages
+      return null;
+    }
+
+    // Handle user messages (request started)
+    if (json.type === 'user' && json.message) {
+      return formatStatus('Cursor is analyzing your request...');
+    }
+
+    // Handle root-level thinking messages (Grok and other models)
+    if (json.type === 'thinking') {
+      if (json.subtype === 'delta' && json.text) {
+        // Accumulate thinking deltas
+        accumulatedThinking += json.text;
+        // Return null for deltas to avoid spamming output with each token
+        return null;
+      } else if (json.subtype === 'completed') {
+        // When thinking is complete, return the full thinking block
+        if (accumulatedThinking) {
+          const result = formatThinking(accumulatedThinking);
+          accumulatedThinking = ''; // Reset for next thinking block
+          return result;
+        }
+        return null;
+      }
+    }
+
     // Handle root-level tool_call messages
     if (json.type === 'tool_call') {
       if (json.subtype === 'started') {
-        // Extract tool name from the tool_call object
-        const toolCall = json.tool_call;
-        const toolName = Object.keys(toolCall).find(key => key.endsWith('ToolCall'));
-        const displayName = toolName ? toolName.replace('ToolCall', '') : 'unknown';
-
-        // Extract additional context from args
-        const toolData = toolCall[toolName as string];
-        const args = toolData?.args || {};
-        let context = '';
-
-        // Add relevant args based on tool type
-        if (args.path) {
-          const pathParts = args.path.split('/');
-          const shortPath = pathParts.length > 3
-            ? `.../${pathParts.slice(-2).join('/')}`
-            : args.path;
-          context = ` ${shortPath}`;
-        } else if (args.file_path) {
-          const pathParts = args.file_path.split('/');
-          const shortPath = pathParts.length > 3
-            ? `.../${pathParts.slice(-2).join('/')}`
-            : args.file_path;
-          context = ` ${shortPath}`;
-        } else if (args.pattern) {
-          context = ` "${args.pattern}"`;
-        }
-
-        return `🔧 TOOL STARTED: ${displayName}${context}`;
+        // Don't show on start - will show with final color when tool_result arrives
+        return null;
       } else if (json.subtype === 'completed') {
-        const toolCall = json.tool_call;
-        const toolName = Object.keys(toolCall).find(key => key.endsWith('ToolCall'));
-        const displayName = toolName ? toolName.replace('ToolCall', '') : 'unknown';
-
-        // Extract additional context from args
-        const toolData = toolCall[toolName as string];
-        const args = toolData?.args || {};
-        let context = '';
-
-        if (args.path) {
-          const pathParts = args.path.split('/');
-          const shortPath = pathParts.length > 3
-            ? `.../${pathParts.slice(-2).join('/')}`
-            : args.path;
-          context = ` ${shortPath}`;
-        } else if (args.file_path) {
-          const pathParts = args.file_path.split('/');
-          const shortPath = pathParts.length > 3
-            ? `.../${pathParts.slice(-2).join('/')}`
-            : args.file_path;
-          context = ` ${shortPath}`;
-        } else if (args.pattern) {
-          context = ` "${args.pattern}"`;
-        }
-
-        return `✅ TOOL COMPLETED: ${displayName}${context}`;
+        // Skip completed events - the result will be shown via tool_result
+        return null;
       }
     }
 
@@ -97,24 +82,46 @@ function formatStreamJsonLine(line: string): string | null {
     if (json.type === 'assistant' && json.message?.content) {
       for (const content of json.message.content) {
         if (content.type === 'text') {
-          return `💬 TEXT: ${content.text}`;
+          return content.text;
         } else if (content.type === 'thinking') {
-          return `🧠 THINKING: ${content.text}`;
+          return formatThinking(content.text);
         } else if (content.type === 'tool_use') {
-          const argKeys = Object.keys(content.input || {}).join(', ');
-          return `🔧 TOOL: ${content.name} | Args: ${argKeys}`;
+          // Track tool name for later use with result
+          if (content.id && content.name) {
+            toolNameMap.set(content.id, content.name);
+          }
+          const commandName = content.name || 'tool';
+          return formatCommand(commandName, 'started');
         }
       }
     } else if (json.type === 'user' && json.message?.content) {
       for (const content of json.message.content) {
         if (content.type === 'tool_result') {
+          // Get tool name from map
+          const toolName = content.tool_use_id ? toolNameMap.get(content.tool_use_id) : undefined;
+          const commandName = toolName || 'tool';
+
+          // Clean up the map entry
+          if (content.tool_use_id) {
+            toolNameMap.delete(content.tool_use_id);
+          }
+
+          let preview: string;
           if (content.is_error) {
-            return `❌ ERROR: ${content.content}`;
+            preview = typeof content.content === 'string' ? content.content : JSON.stringify(content.content);
+            // Show command in red with nested error
+            return formatCommand(commandName, 'error') + '\n' + formatResult(preview, true);
           } else {
-            const preview = typeof content.content === 'string'
-              ? content.content.substring(0, 100) + '...'
-              : JSON.stringify(content.content);
-            return `✅ RESULT: ${preview}`;
+            if (typeof content.content === 'string') {
+              const trimmed = content.content.trim();
+              preview = trimmed
+                ? (trimmed.length > 100 ? trimmed.substring(0, 100) + '...' : trimmed)
+                : 'empty';
+            } else {
+              preview = JSON.stringify(content.content);
+            }
+            // Show command in green with nested result
+            return formatCommand(commandName, 'success') + '\n' + formatResult(preview, false);
           }
         }
       }
@@ -184,8 +191,11 @@ export async function runCursor(options: RunCursorOptions): Promise<RunCursorRes
     cursorConfigDir
   });
 
-  logger.debug(`Cursor runner - prompt length: ${prompt.length}, lines: ${prompt.split('\n').length}`);
-  logger.debug(`Cursor runner - args count: ${args.length}, model: ${model ?? 'auto'}`);
+  // Debug logging only when LOG_LEVEL=debug
+  if (process.env.LOG_LEVEL === 'debug') {
+    console.error(`[DEBUG] Cursor runner - prompt length: ${prompt.length}, lines: ${prompt.split('\n').length}`);
+    console.error(`[DEBUG] Cursor runner - args count: ${args.length}, model: ${model ?? 'auto'}`);
+  }
 
   let result;
   try {
@@ -235,7 +245,7 @@ export async function runCursor(options: RunCursorOptions): Promise<RunCursorRes
       const full = `${command} ${args.join(' ')}`.trim();
       const install = metadata.installCommand;
       const name = metadata.name;
-      logger.error(`${name} CLI not found when executing: ${full}`);
+      console.error(`[ERROR] ${name} CLI not found when executing: ${full}`);
       throw new Error(`'${command}' is not available on this system. Please install ${name} first:\n  ${install}`);
     }
     throw error;
@@ -245,7 +255,7 @@ export async function runCursor(options: RunCursorOptions): Promise<RunCursorRes
     const errorOutput = result.stderr.trim() || result.stdout.trim() || 'no error output';
     const lines = errorOutput.split('\n').slice(0, 10);
 
-    logger.error('Cursor CLI execution failed', {
+    console.error('[ERROR] Cursor CLI execution failed', {
       exitCode: result.exitCode,
       error: lines.join('\n'),
       command: `${command} ${args.join(' ')}`,

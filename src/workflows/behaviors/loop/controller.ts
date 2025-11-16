@@ -1,7 +1,9 @@
 import type { WorkflowStep } from '../../templates/index.js';
+import { isModuleStep } from '../../templates/types.js';
 import { evaluateLoopBehavior } from './evaluator.js';
 import { formatAgentLog } from '../../../shared/logging/index.js';
 import type { ActiveLoop } from '../skip.js';
+import type { WorkflowUIManager } from '../../../ui/index.js';
 
 export interface LoopDecision {
   shouldRepeat: boolean;
@@ -16,7 +18,13 @@ export async function handleLoopLogic(
   output: string,
   loopCounters: Map<string, number>,
   cwd: string,
+  ui?: WorkflowUIManager,
 ): Promise<{ decision: LoopDecision | null; newIndex: number }> {
+  // Only module steps can have loop behavior
+  if (!isModuleStep(step)) {
+    return { decision: null, newIndex: index };
+  }
+
   const loopKey = `${step.module?.id ?? step.agentId}:${index}`;
   const iterationCount = loopCounters.get(loopKey) ?? 0;
   const loopDecision = await evaluateLoopBehavior({
@@ -43,19 +51,19 @@ export async function handleLoopLogic(
     const stepsBack = Math.max(1, loopDecision.stepsBack);
     const rewindIndex = Math.max(-1, index - stepsBack - 1);
 
-    const skipList = step.module?.behavior?.skip ?? [];
+    const skipList = step.module?.behavior?.type === 'loop' ? step.module.behavior.skip ?? [] : [];
     const skipInfo = skipList.length > 0 ? ` (skipping: ${skipList.join(', ')})` : '';
 
-    console.log(
-      formatAgentLog(
-        step.agentId,
-        `${step.agentName} triggered a loop` +
-          `${loopDecision.reason ? ` (${loopDecision.reason})` : ''}; ` +
-          `repeating previous step. Iteration ${nextIterationCount}${
-            step.module?.behavior?.maxIterations ? `/${step.module.behavior.maxIterations}` : ''
-          }${skipInfo}.`,
-      ),
-    );
+    const maxIter = step.module?.behavior?.type === 'loop' ? step.module.behavior.maxIterations : undefined;
+    const message = `${step.agentName} triggered a loop` +
+      `${loopDecision.reason ? ` (${loopDecision.reason})` : ''}; ` +
+      `repeating previous step. Iteration ${nextIterationCount}${maxIter ? `/${maxIter}` : ''}${skipInfo}.`;
+
+    if (ui) {
+      ui.logMessage(step.agentId, message);
+    } else {
+      console.log(formatAgentLog(step.agentId, message));
+    }
 
     return {
       decision: { shouldRepeat: true, stepsBack, skipList, reason: loopDecision.reason },
@@ -64,7 +72,11 @@ export async function handleLoopLogic(
   }
 
   if (loopDecision?.reason) {
-    console.log(formatAgentLog(step.agentId, `${step.agentName} loop skipped: ${loopDecision.reason}.`));
+    if (ui) {
+      ui.logMessage(step.agentId, `${step.agentName} loop skipped: ${loopDecision.reason}.`);
+    } else {
+      console.log(formatAgentLog(step.agentId, `${step.agentName} loop skipped: ${loopDecision.reason}.`));
+    }
   }
 
   // Clear loop counter when loop terminates

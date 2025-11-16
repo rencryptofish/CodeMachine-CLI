@@ -4,12 +4,9 @@ import * as fs from 'node:fs';
 import type { RunWorkflowOptions } from '../templates/index.js';
 import { loadTemplateWithPath } from '../templates/index.js';
 import {
-  getAgentLoggers,
   formatAgentLog,
-  startSpinner,
-  stopSpinner,
-  createSpinnerLoggers,
 } from '../../shared/logging/index.js';
+import { debug } from '../../shared/logging/logger.js';
 import {
   getTemplatePathFromTracking,
   getCompletedSteps,
@@ -23,11 +20,67 @@ import { registry } from '../../infra/engines/index.js';
 import { shouldSkipStep, logSkipDebug, type ActiveLoop } from '../behaviors/skip.js';
 import { handleLoopLogic, createActiveLoop } from '../behaviors/loop/controller.js';
 import { handleTriggerLogic } from '../behaviors/trigger/controller.js';
+import { handleCheckpointLogic } from '../behaviors/checkpoint/controller.js';
 import { executeStep } from './step.js';
 import { executeTriggerAgent } from './trigger.js';
 import { shouldExecuteFallback, executeFallbackStep } from './fallback.js';
+import { WorkflowUIManager } from '../../ui/index.js';
+import { MonitoringCleanup } from '../../agents/monitoring/index.js';
+
+/**
+ * Cache for engine authentication status with TTL
+ * Prevents repeated auth checks (which can take 10-30 seconds)
+ */
+class EngineAuthCache {
+  private cache: Map<string, { isAuthenticated: boolean; timestamp: number }> = new Map();
+  private ttlMs: number = 5 * 60 * 1000; // 5 minutes TTL
+
+  /**
+   * Check if engine is authenticated (with caching)
+   */
+  async isAuthenticated(engineId: string, checkFn: () => Promise<boolean>): Promise<boolean> {
+    const cached = this.cache.get(engineId);
+    const now = Date.now();
+
+    // Return cached value if still valid
+    if (cached && (now - cached.timestamp) < this.ttlMs) {
+      return cached.isAuthenticated;
+    }
+
+    // Cache miss or expired - perform actual check
+    const result = await checkFn();
+
+    // Cache the result
+    this.cache.set(engineId, {
+      isAuthenticated: result,
+      timestamp: now
+    });
+
+    return result;
+  }
+
+  /**
+   * Invalidate cache for specific engine
+   */
+  invalidate(engineId: string): void {
+    this.cache.delete(engineId);
+  }
+
+  /**
+   * Clear entire cache
+   */
+  clear(): void {
+    this.cache.clear();
+  }
+}
+
+// Global auth cache instance
+const authCache = new EngineAuthCache();
 
 export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<void> {
+  // Set up cleanup handlers for graceful shutdown
+  MonitoringCleanup.setup();
+
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
 
   // Load template from .codemachine/template.json or use provided path
@@ -36,7 +89,7 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
 
   const { template } = await loadTemplateWithPath(cwd, templatePath);
 
-  console.log(`Using workflow template: ${template.name}`);
+  debug(`Using workflow template: ${template.name}`);
 
   // Sync agent configurations before running the workflow
   const workflowAgents = Array.from(
@@ -76,6 +129,46 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
   let activeLoop: ActiveLoop | null = null;
   const workflowStartTime = Date.now();
 
+  // Initialize Workflow UI Manager
+  const ui = new WorkflowUIManager(template.name);
+
+  // Pre-populate timeline with all workflow steps BEFORE starting UI
+  // This prevents duplicate renders at startup
+  // Set initial status based on completion tracking
+  template.steps.forEach((step, stepIndex) => {
+    if (step.type === 'module') {
+      const defaultEngine = registry.getDefault();
+      const engineType = step.engine ?? defaultEngine?.metadata.id ?? 'unknown';
+      const engineName = engineType; // preserve original engine type, even if unknown
+
+      // Create a unique identifier for each step instance (agentId + stepIndex)
+      // This allows multiple instances of the same agent to appear separately in the UI
+      const uniqueAgentId = `${step.agentId}-step-${stepIndex}`;
+
+      // Determine initial status based on completion tracking
+      let initialStatus: 'pending' | 'completed' = 'pending';
+      if (completedSteps.includes(stepIndex)) {
+        initialStatus = 'completed';
+      }
+
+      const agentId = ui.addMainAgent(step.agentName ?? step.agentId, engineName, stepIndex, initialStatus, uniqueAgentId);
+
+      // Update agent with step information
+      const state = ui.getState();
+      const agent = state.agents.find(a => a.id === agentId);
+      if (agent) {
+        agent.stepIndex = stepIndex;
+        agent.totalSteps = template.steps.filter(s => s.type === 'module').length;
+      }
+    } else if (step.type === 'ui') {
+      // Pre-populate UI elements
+      ui.addUIElement(step.text, stepIndex);
+    }
+  });
+
+  // Start UI after all agents are pre-populated (single clean render)
+  ui.start();
+
   // Get the starting index based on resume configuration
   const startIndex = await getResumeStartIndex(cmRoot);
 
@@ -83,22 +176,50 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
     console.log(`Resuming workflow from step ${startIndex}...`);
   }
 
-  for (let index = startIndex; index < template.steps.length; index += 1) {
+  // Workflow stop flag for Ctrl+C handling
+  let workflowShouldStop = false;
+  let stoppedByCheckpointQuit = false;
+  const stopListener = () => {
+    workflowShouldStop = true;
+  };
+  process.on('workflow:stop', stopListener);
+
+  try {
+    for (let index = startIndex; index < template.steps.length; index += 1) {
+    // Check if workflow should stop (Ctrl+C pressed)
+    if (workflowShouldStop) {
+      console.log(formatAgentLog('workflow', 'Workflow stopped by user.'));
+      break;
+    }
+
     const step = template.steps[index];
+
+    // UI elements are pre-populated and don't need execution
+    if (step.type === 'ui') {
+      continue;
+    }
+
     if (step.type !== 'module') {
       continue;
     }
 
-    const skipResult = shouldSkipStep(step, index, completedSteps, activeLoop);
+    // Create unique agent ID for this step instance (matches UI pre-population)
+    const uniqueAgentId = `${step.agentId}-step-${index}`;
+
+    const skipResult = shouldSkipStep(step, index, completedSteps, activeLoop, ui, uniqueAgentId);
     if (skipResult.skip) {
-      console.log(formatAgentLog(step.agentId, skipResult.reason!));
+      ui.logMessage(uniqueAgentId, skipResult.reason!);
       continue;
     }
 
     logSkipDebug(step, activeLoop);
 
-    console.log('═'.repeat(80));
-    console.log(formatAgentLog(step.agentId, `${step.agentName} started to work.`));
+    // Update UI status to running (this clears the output buffer)
+    ui.updateAgentStatus(uniqueAgentId, 'running');
+
+    // Log start message AFTER clearing buffer
+    ui.logMessage(uniqueAgentId, '═'.repeat(80));
+    ui.logMessage(uniqueAgentId, `${step.agentName} started to work.`);
 
     // Reset behavior file to default "continue" before each agent run
     const behaviorFile = path.join(cwd, '.codemachine/memory/behavior.json');
@@ -111,8 +232,6 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
     // Mark step as started (adds to notCompletedSteps)
     await markStepStarted(cmRoot, index);
 
-    const { stdout: baseStdoutLogger, stderr: baseStderrLogger } = getAgentLoggers(step.agentId);
-
     // Determine engine: step override > first authenticated engine
     let engineType: string;
     if (step.engine) {
@@ -120,7 +239,9 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
 
       // If an override is provided but not authenticated, log and fall back
       const overrideEngine = registry.get(engineType);
-      const isOverrideAuthed = overrideEngine ? await overrideEngine.auth.isAuthenticated() : false;
+      const isOverrideAuthed = overrideEngine
+        ? await authCache.isAuthenticated(overrideEngine.metadata.id, () => overrideEngine.auth.isAuthenticated())
+        : false;
       if (!isOverrideAuthed) {
         const pretty = overrideEngine?.metadata.name ?? engineType;
         console.error(
@@ -130,11 +251,15 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
           ),
         );
 
-        // Find first authenticated engine by order
+        // Find first authenticated engine by order (with caching)
         const engines = registry.getAll();
         let fallbackEngine = null as typeof overrideEngine | null;
         for (const eng of engines) {
-          if (await eng.auth.isAuthenticated()) {
+          const isAuth = await authCache.isAuthenticated(
+            eng.metadata.id,
+            () => eng.auth.isAuthenticated()
+          );
+          if (isAuth) {
             fallbackEngine = eng;
             break;
           }
@@ -156,12 +281,15 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
         }
       }
     } else {
-      // Fallback: find first authenticated engine by order
+      // Fallback: find first authenticated engine by order (with caching)
       const engines = registry.getAll();
       let foundEngine = null;
 
       for (const engine of engines) {
-        const isAuth = await engine.auth.isAuthenticated();
+        const isAuth = await authCache.isAuthenticated(
+          engine.metadata.id,
+          () => engine.auth.isAuthenticated()
+        );
         if (isAuth) {
           foundEngine = engine;
           break;
@@ -178,7 +306,7 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
       }
 
       engineType = foundEngine.metadata.id;
-      console.log(formatAgentLog(step.agentId, `No engine specified, using ${foundEngine.metadata.name} (${engineType})`));
+      ui.logMessage(uniqueAgentId, `No engine specified, using ${foundEngine.metadata.name} (${engineType})`);
     }
 
     // Ensure the selected engine is used during execution
@@ -188,9 +316,9 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
 
     // Check if fallback should be executed before the original step
     if (shouldExecuteFallback(step, index, notCompletedSteps)) {
-      console.log(formatAgentLog(step.agentId, `Detected incomplete step. Running fallback agent first.`));
+      ui.logMessage(uniqueAgentId, `Detected incomplete step. Running fallback agent first.`);
       try {
-        await executeFallbackStep(step, cwd, workflowStartTime, engineType);
+        await executeFallbackStep(step, cwd, workflowStartTime, engineType, ui, uniqueAgentId);
       } catch (error) {
         // Fallback failed, step remains in notCompletedSteps
         console.error(
@@ -199,51 +327,135 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
             `Fallback failed. Skipping original step retry.`,
           ),
         );
+        // Don't update status to failed - just let it stay as running or retrying
         throw error;
       }
     }
 
-    // Resolve model and reasoning effort for display
-    const engineModule = registry.get(engineType);
-    const model = step.model ?? engineModule?.metadata.defaultModel;
-    const reasoning = step.modelReasoningEffort ?? engineModule?.metadata.defaultModelReasoningEffort;
-
-    const spinnerState = startSpinner(step.agentName, engineType, workflowStartTime, model, reasoning);
-    const { stdoutLogger, stderrLogger } = createSpinnerLoggers(
-      baseStdoutLogger,
-      baseStderrLogger,
-      spinnerState,
-    );
+    // Set up skip listener and abort controller for this step
+    const abortController = new AbortController();
+    const skipListener = () => {
+      ui.logMessage(uniqueAgentId, '⏭️  Skip requested by user...');
+      abortController.abort();
+    };
+    process.once('workflow:skip', skipListener);
 
     try {
       const output = await executeStep(step, cwd, {
-        logger: stdoutLogger,
-        stderrLogger,
+        logger: () => {}, // No-op: UI reads from log files
+        stderrLogger: () => {}, // No-op: UI reads from log files
+        ui,
+        abortSignal: abortController.signal,
+        uniqueAgentId,
       });
 
       // Check for trigger behavior first
-      const triggerResult = await handleTriggerLogic(step, output, cwd);
+      const triggerResult = await handleTriggerLogic(step, output, cwd, ui);
       if (triggerResult?.shouldTrigger && triggerResult.triggerAgentId) {
+        const triggeredAgentId = triggerResult.triggerAgentId; // Capture for use in callbacks
         try {
           await executeTriggerAgent({
-            triggerAgentId: triggerResult.triggerAgentId,
+            triggerAgentId: triggeredAgentId,
             cwd,
             engineType,
-            logger: stdoutLogger,
-            stderrLogger,
-            sourceAgentId: step.agentId,
+            logger: () => {}, // No-op: UI reads from log files
+            stderrLogger: () => {}, // No-op: UI reads from log files
+            sourceAgentId: uniqueAgentId,
+            ui,
+            abortSignal: abortController.signal,
           });
         } catch (triggerError) {
-          // Continue with workflow even if triggered agent fails
+          // Check if this was a user-requested skip (abort)
+          if (triggerError instanceof Error && triggerError.name === 'AbortError') {
+            ui.updateAgentStatus(triggeredAgentId, 'skipped');
+            ui.logMessage(triggeredAgentId, `Triggered agent was skipped by user.`);
+          }
+          // Continue with workflow even if triggered agent fails or is skipped
         }
       }
 
-      const loopResult = await handleLoopLogic(step, index, output, loopCounters, cwd);
+      // Remove from notCompletedSteps immediately after successful execution
+      // This must happen BEFORE loop logic to ensure cleanup even when loops trigger
+      await removeFromNotCompleted(cmRoot, index);
+
+      // Mark step as completed if executeOnce is true
+      if (step.executeOnce) {
+        await markStepCompleted(cmRoot, index);
+      }
+
+      // Update UI status to completed
+      // This must happen BEFORE loop logic to ensure UI updates even when loops trigger
+      ui.updateAgentStatus(uniqueAgentId, 'completed');
+
+      // Log completion messages BEFORE loop check (so they're part of current agent's output)
+      ui.logMessage(uniqueAgentId, `${step.agentName} has completed their work.`);
+      ui.logMessage(uniqueAgentId, '\n' + '═'.repeat(80) + '\n');
+
+      // Check for checkpoint behavior first (to pause workflow for manual review)
+      const checkpointResult = await handleCheckpointLogic(step, output, cwd, ui);
+      if (checkpointResult?.shouldStopWorkflow) {
+        // Wait for user action via events (Continue or Quit)
+        await new Promise<void>((resolve) => {
+          const continueHandler = () => {
+            cleanup();
+            resolve();
+          };
+          const quitHandler = () => {
+            cleanup();
+            workflowShouldStop = true;
+            stoppedByCheckpointQuit = true;
+            resolve();
+          };
+          const cleanup = () => {
+            process.removeListener('checkpoint:continue', continueHandler);
+            process.removeListener('checkpoint:quit', quitHandler);
+          };
+
+          process.once('checkpoint:continue', continueHandler);
+          process.once('checkpoint:quit', quitHandler);
+        });
+
+        // Clear checkpoint state and resume
+        ui.clearCheckpointState();
+
+        if (workflowShouldStop) {
+          // User chose to quit from checkpoint - set status to stopped
+          ui.setWorkflowStatus('stopped');
+          break; // User chose to quit
+        }
+        // Otherwise continue to next step (current step already marked complete via executeOnce)
+      }
+
+      const loopResult = await handleLoopLogic(step, index, output, loopCounters, cwd, ui);
 
       if (loopResult.decision?.shouldRepeat) {
         // Set active loop with skip list
         activeLoop = createActiveLoop(loopResult.decision);
-        stopSpinner(spinnerState);
+
+        // Update UI loop state
+        const loopKey = `${step.module?.id ?? step.agentId}:${index}`;
+        const iteration = (loopCounters.get(loopKey) || 0) + 1;
+        ui.setLoopState({
+          active: true,
+          sourceAgent: uniqueAgentId,
+          backSteps: loopResult.decision.stepsBack,
+          iteration,
+          maxIterations: step.module?.behavior?.type === 'loop' ? step.module.behavior.maxIterations ?? Infinity : Infinity,
+          skipList: loopResult.decision.skipList || [],
+          reason: loopResult.decision.reason,
+        });
+
+        // Reset all agents that will be re-executed in the loop
+        // Clear their UI data (telemetry, tool counts, subagents) and monitoring registry data
+        // Save their current state to execution history with cycle number
+        for (let resetIndex = loopResult.newIndex; resetIndex <= index; resetIndex += 1) {
+          const resetStep = template.steps[resetIndex];
+          if (resetStep && resetStep.type === 'module') {
+            const resetUniqueAgentId = `${resetStep.agentId}-step-${resetIndex}`;
+            await ui.resetAgentForLoop(resetUniqueAgentId, iteration);
+          }
+        }
+
         index = loopResult.newIndex;
         continue;
       }
@@ -252,29 +464,70 @@ export async function runWorkflow(options: RunWorkflowOptions = {}): Promise<voi
       const newActiveLoop = createActiveLoop(loopResult.decision);
       if (newActiveLoop !== (undefined as unknown as ActiveLoop | null)) {
         activeLoop = newActiveLoop;
+        if (!newActiveLoop) {
+          ui.setLoopState(null);
+          ui.clearLoopRound(uniqueAgentId);
+        }
       }
-
-      stopSpinner(spinnerState);
-
-      // Remove from notCompletedSteps (step finished successfully)
-      await removeFromNotCompleted(cmRoot, index);
-
-      // Mark step as completed if executeOnce is true
-      if (step.executeOnce) {
-        await markStepCompleted(cmRoot, index);
-      }
-
-      console.log(formatAgentLog(step.agentId, `${step.agentName} has completed their work.`));
-      console.log('\n' + '═'.repeat(80) + '\n');
     } catch (error) {
-      stopSpinner(spinnerState);
-      console.error(
-        formatAgentLog(
-          step.agentId,
-          `${step.agentName} failed: ${error instanceof Error ? error.message : String(error)}`,
-        ),
-      );
-      throw error;
+      // Check if this was a user-requested skip (abort)
+      if (error instanceof Error && error.name === 'AbortError') {
+        ui.updateAgentStatus(uniqueAgentId, 'skipped');
+        ui.logMessage(uniqueAgentId, `${step.agentName} was skipped by user.`);
+        ui.logMessage(uniqueAgentId, '\n' + '═'.repeat(80) + '\n');
+        // Continue to next step - don't throw
+      } else {
+        // Don't update status to failed - let it stay as running/retrying
+        console.error(
+          formatAgentLog(
+            step.agentId,
+            `${step.agentName} failed: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+        throw error;
+      }
+    } finally {
+      // Always clean up the skip listener
+      process.removeListener('workflow:skip', skipListener);
     }
+  }
+
+  // Check if workflow was stopped by user (Ctrl+C or checkpoint quit)
+  if (workflowShouldStop) {
+    if (stoppedByCheckpointQuit) {
+      // Workflow was stopped by checkpoint quit - status already set to 'stopped'
+      // UI will stay running showing the stopped status
+      // Wait indefinitely - user can press Ctrl+C to exit
+      await new Promise(() => {
+        // Never resolves - keeps event loop alive until Ctrl+C exits process
+      });
+    } else {
+      // Workflow was stopped by Ctrl+C - status already updated by MonitoringCleanup handler
+      // Keep UI alive to show "Press Ctrl+C again to exit" message
+      // The second Ctrl+C will be handled by MonitoringCleanup's SIGINT handler
+      // Wait indefinitely - the SIGINT handler will call process.exit()
+      await new Promise(() => {
+        // Never resolves - keeps event loop alive until second Ctrl+C exits process
+      });
+    }
+  }
+
+  // Workflow completed successfully
+  MonitoringCleanup.clearWorkflowHandlers();
+
+  // Set status to completed and keep UI alive
+  ui.setWorkflowStatus('completed');
+  // UI will stay running - user presses Ctrl+C to exit with two-stage behavior
+  // Wait indefinitely - the SIGINT handler will call process.exit()
+  await new Promise(() => {
+    // Never resolves - keeps event loop alive until Ctrl+C exits process
+  });
+  } catch (error) {
+    // On workflow error, set status and exit
+    ui.setWorkflowStatus('stopped');
+    throw error;
+  } finally {
+    // Clean up workflow stop listener
+    process.removeListener('workflow:stop', stopListener);
   }
 }

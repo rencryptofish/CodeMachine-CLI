@@ -4,11 +4,19 @@ coverage/
 .DS_Store
 reports/
 
+package-lock.json
+
 # Ignore specific dotfiles/folders
 .codemachine
+.codemachine/memory
 .env
 .env.example
 .npmrc
 
 # Ignore folders starting with .tmp
 .tmp*
+.vscode
+.codemachine/logs
+.codemachine/prompts
+.codemachine/agents
+.codemachine/template.json

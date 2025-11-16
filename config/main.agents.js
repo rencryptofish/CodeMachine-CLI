@@ -71,6 +71,52 @@ module.exports = [
     promptPath: path.join(promptsDir, 'codemachine', 'fallback-agents', 'task-breakdown-fallback.md'),
   },
 
+  // Test agents
+  {
+    id: 'test-agent-1',
+    name: 'Test Agent 1',
+    description: 'First test agent for workflow testing',
+    promptPath: path.join(promptsDir, 'test-workflows', 'test-agent-1.md'),
+  },
+  {
+    id: 'test-agent-2',
+    name: 'Test Agent 2',
+    description: 'Second test agent for workflow testing',
+    promptPath: path.join(promptsDir, 'test-workflows', 'test-agent-2.md'),
+  },
+  {
+    id: 'test-agent-3',
+    name: 'Test Agent 3',
+    description: 'Third test agent for workflow testing',
+    promptPath: path.join(promptsDir, 'test-workflows', 'test-agent-3.md'),
+  },
+
+  // Dev codemachine agents
+  {
+    id: 'init',
+    name: 'Init',
+    description: 'Initializes codemachine development environment (creates branch and updates .gitignore)',
+    promptPath: path.join(promptsDir, 'dev-codemachine', 'main-agents', '00-init.md'),
+  },
+  {
+    id: 'principal-analyst',
+    name: 'Principal Analyst - Checkpoint',
+    description: 'Reviews project specifications and identifies critical ambiguities requiring clarification',
+    promptPath: path.join(promptsDir, 'dev-codemachine', 'main-agents', '01-principal-analyst.md'),
+  },
+  {
+    id: 'specifications-indexer',
+    name: 'Specifications Indexer',
+    description: 'Indexes and structures project specifications for efficient access and reference',
+    promptPath: path.join(promptsDir, 'dev-codemachine', 'main-agents', '02-specifications-indexer.md'),
+  },
+  {
+    id: 'blueprint-orchestrator',
+    name: 'Blueprint Orchestrator',
+    description: 'Orchestrates the execution of Foundation, Structural-Data, Behavior, and Ops-Docs architects with resilience and resumability',
+    promptPath: path.join(promptsDir, 'dev-codemachine', 'main-agents', '04-blueprint-orchestrator.md'),
+  },
+
   // Folder configurations - applies settings to all agents in the folder
   //{
   //  type: 'folder',

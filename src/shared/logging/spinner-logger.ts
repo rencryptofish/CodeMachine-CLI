@@ -10,7 +10,23 @@ export interface SpinnerState {
   workflowStartTime: number;
 }
 
+/**
+ * Check if Ink UI is active by detecting if stdout is in raw mode
+ * When Ink is running, it takes control of the terminal
+ */
+function isInkUIActive(): boolean {
+  // Check if stdout is a TTY and in raw mode (Ink uses raw mode)
+  interface ReadStreamWithRaw extends NodeJS.ReadStream {
+    isRaw: boolean;
+  }
+  return Boolean(process.stdout.isTTY && (process.stdin as ReadStreamWithRaw).isRaw);
+}
+
 function clearStatusLine(): void {
+  // Don't interfere with Ink's rendering
+  if (isInkUIActive()) {
+    return;
+  }
   readline.clearLine(process.stdout, 0);
   readline.cursorTo(process.stdout, 0);
 }
@@ -59,6 +75,7 @@ export function startSpinner(
   workflowStartTime?: number,
   model?: string,
   reasoningEffort?: 'low' | 'medium' | 'high' | string,
+  stepInfo?: { current: number; total: number },
 ): SpinnerState {
   const spinnerChars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   const now = Date.now();
@@ -72,6 +89,11 @@ export function startSpinner(
   };
 
   spinnerState.interval = setInterval(() => {
+    // Don't render spinner if Ink UI is active (prevents stdout conflicts)
+    if (isInkUIActive()) {
+      return;
+    }
+
     const now = Date.now();
     const timeSinceLastOutput = now - spinnerState.lastOutputTime;
     const timeSinceLastClear = now - spinnerState.lastClearTime;
@@ -87,7 +109,8 @@ export function startSpinner(
       const reasoningDisplay = reasoningEffort ? ` | Reasoning: ${reasoningEffort}` : '';
       const runtime = formatElapsedTime(spinnerState.workflowStartTime);
       // Special color for status indicator - dim yellow/orange
-      const baseMessage = `${spinner} ${agentName} is running${engineDisplay}${modelDisplay}${reasoningDisplay}... | Workflow Runtime: ${runtime}`;
+      const stepDisplay = stepInfo ? ` (Step ${stepInfo.current}/${stepInfo.total})` : '';
+      const baseMessage = `${spinner} ${agentName}${stepDisplay} is running${engineDisplay}${modelDisplay}${reasoningDisplay}... | Workflow Runtime: ${runtime}`;
       const columns = typeof process.stdout.columns === 'number' && process.stdout.columns > 0 ? process.stdout.columns : 80;
       const ellipsis = '...';
       const needsTruncate = baseMessage.length > columns;

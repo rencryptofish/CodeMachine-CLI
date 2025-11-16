@@ -1,17 +1,14 @@
 import type { WorkflowStep } from '../templates/index.js';
-import {
-  formatAgentLog,
-  startSpinner,
-  stopSpinner,
-  createSpinnerLoggers,
-  getAgentLoggers,
-} from '../../shared/logging/index.js';
+import { isModuleStep } from '../templates/types.js';
+import { formatAgentLog } from '../../shared/logging/index.js';
 import { executeStep } from './step.js';
 import { mainAgents } from '../utils/config.js';
+import type { WorkflowUIManager } from '../../ui/index.js';
 
 export interface FallbackExecutionOptions {
   logger: (message: string) => void;
   stderrLogger: (message: string) => void;
+  ui?: WorkflowUIManager;
 }
 
 /**
@@ -23,7 +20,7 @@ export function shouldExecuteFallback(
   stepIndex: number,
   notCompletedSteps: number[],
 ): boolean {
-  return notCompletedSteps.includes(stepIndex) && !!step.notCompletedFallback;
+  return isModuleStep(step) && notCompletedSteps.includes(stepIndex) && !!step.notCompletedFallback;
 }
 
 /**
@@ -35,14 +32,24 @@ export async function executeFallbackStep(
   cwd: string,
   workflowStartTime: number,
   engineType: string,
+  ui?: WorkflowUIManager,
+  uniqueParentAgentId?: string,
 ): Promise<void> {
+  // Only module steps can have fallback agents
+  if (!isModuleStep(step)) {
+    throw new Error('Only module steps can have fallback agents');
+  }
+
   if (!step.notCompletedFallback) {
     throw new Error('No fallback agent defined for this step');
   }
 
   const fallbackAgentId = step.notCompletedFallback;
+  const parentAgentId = uniqueParentAgentId ?? step.agentId;
 
-  console.log(formatAgentLog(fallbackAgentId, `Fallback agent for ${step.agentName} started to work.`));
+  if (ui) {
+    ui.logMessage(fallbackAgentId, `Fallback agent for ${step.agentName} started to work.`);
+  }
 
   // Look up the fallback agent's configuration to get its prompt path
   const fallbackAgent = mainAgents.find((agent) => agent?.id === fallbackAgentId);
@@ -62,33 +69,38 @@ export async function executeFallbackStep(
     promptPath: fallbackAgent.promptPath, // Use the fallback agent's prompt, not the original step's
   };
 
-  const { stdout: baseStdoutLogger, stderr: baseStderrLogger } = getAgentLoggers(fallbackAgentId);
-
-  const spinnerState = startSpinner(
-    fallbackAgentId,
-    engineType,
-    workflowStartTime,
-    step.model,
-    step.modelReasoningEffort,
-  );
-
-  const { stdoutLogger, stderrLogger } = createSpinnerLoggers(
-    baseStdoutLogger,
-    baseStderrLogger,
-    spinnerState,
-  );
+  // Add fallback agent to UI as sub-agent
+  if (ui) {
+    const engineName = engineType; // preserve original engine type, even if unknown
+    ui.addSubAgent(parentAgentId, {
+      id: fallbackAgentId,
+      name: fallbackAgent.name || fallbackAgentId,
+      engine: engineName,
+      status: 'running',
+      parentId: parentAgentId,
+      startTime: Date.now(),
+      telemetry: { tokensIn: 0, tokensOut: 0 },
+      toolCount: 0,
+      thinkingCount: 0,
+    });
+  }
 
   try {
     await executeStep(fallbackStep, cwd, {
-      logger: stdoutLogger,
-      stderrLogger,
+      logger: () => {}, // No-op: UI reads from log files
+      stderrLogger: () => {}, // No-op: UI reads from log files
+      ui,
+      uniqueAgentId: fallbackAgentId,
     });
 
-    stopSpinner(spinnerState);
-    console.log(formatAgentLog(fallbackAgentId, `Fallback agent completed successfully.`));
-    console.log('═'.repeat(80));
+    // Update UI status on success
+    if (ui) {
+      ui.updateAgentStatus(fallbackAgentId, 'completed');
+      ui.logMessage(fallbackAgentId, `Fallback agent completed successfully.`);
+      ui.logMessage(fallbackAgentId, '═'.repeat(80));
+    }
   } catch (error) {
-    stopSpinner(spinnerState);
+    // Don't update status to failed - let it stay as running/retrying
     console.error(
       formatAgentLog(
         fallbackAgentId,

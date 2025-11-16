@@ -5,8 +5,9 @@ import { spawnProcess } from '../../../../process/spawn.js';
 import { buildClaudeExecCommand } from './commands.js';
 import { metadata } from '../metadata.js';
 import { expandHomeDir } from '../../../../../shared/utils/index.js';
-import { logger } from '../../../../../shared/logging/index.js';
 import { createTelemetryCapture } from '../../../../../shared/telemetry/index.js';
+import type { ParsedTelemetry } from '../../../core/types.js';
+import { formatThinking, formatCommand, formatResult, formatStatus } from '../../../../../shared/formatters/outputMarkers.js';
 
 export interface RunClaudeOptions {
   prompt: string;
@@ -15,6 +16,7 @@ export interface RunClaudeOptions {
   env?: NodeJS.ProcessEnv;
   onData?: (chunk: string) => void;
   onErrorData?: (chunk: string) => void;
+  onTelemetry?: (telemetry: ParsedTelemetry) => void;
   abortSignal?: AbortSignal;
   timeout?: number; // Timeout in milliseconds (default: 1800000ms = 30 minutes)
 }
@@ -26,6 +28,9 @@ export interface RunClaudeResult {
 
 const ANSI_ESCAPE_SEQUENCE = new RegExp(String.raw`\u001B\[[0-9;?]*[ -/]*[@-~]`, 'g');
 
+// Track tool names for associating with results
+const toolNameMap = new Map<string, string>();
+
 /**
  * Formats a Claude stream-json line for display
  */
@@ -36,29 +41,65 @@ function formatStreamJsonLine(line: string): string | null {
     if (json.type === 'assistant' && json.message?.content) {
       for (const content of json.message.content) {
         if (content.type === 'text') {
-          return `💬 TEXT: ${content.text}`;
+          return content.text;
         } else if (content.type === 'thinking') {
-          return `🧠 THINKING: ${content.text}`;
+          return formatThinking(content.text);
         } else if (content.type === 'tool_use') {
-          const argKeys = Object.keys(content.input || {}).join(', ');
-          return `🔧 TOOL: ${content.name} | Args: ${argKeys}`;
+          // Track tool name for later use with result
+          if (content.id && content.name) {
+            toolNameMap.set(content.id, content.name);
+          }
+          const commandName = content.name || 'tool';
+          return formatCommand(commandName, 'started');
         }
       }
     } else if (json.type === 'user' && json.message?.content) {
       for (const content of json.message.content) {
         if (content.type === 'tool_result') {
+          // Get tool name from map
+          const toolName = content.tool_use_id ? toolNameMap.get(content.tool_use_id) : undefined;
+          const commandName = toolName || 'tool';
+
+          // Clean up the map entry
+          if (content.tool_use_id) {
+            toolNameMap.delete(content.tool_use_id);
+          }
+
+          let preview: string;
           if (content.is_error) {
-            return `❌ ERROR: ${content.content}`;
+            preview = typeof content.content === 'string' ? content.content : JSON.stringify(content.content);
+            // Show command in red with nested error
+            return formatCommand(commandName, 'error') + '\n' + formatResult(preview, true);
           } else {
-            const preview = typeof content.content === 'string'
-              ? content.content.substring(0, 100) + '...'
-              : JSON.stringify(content.content);
-            return `✅ RESULT: ${preview}`;
+            if (typeof content.content === 'string') {
+              const trimmed = content.content.trim();
+              preview = trimmed
+                ? (trimmed.length > 100 ? trimmed.substring(0, 100) + '...' : trimmed)
+                : 'empty';
+            } else {
+              preview = JSON.stringify(content.content);
+            }
+            // Show command in green with nested result
+            return formatCommand(commandName, 'success') + '\n' + formatResult(preview, false);
           }
         }
       }
+    } else if (json.type === 'system' && json.subtype === 'init') {
+      // Show status message when session starts
+      return formatStatus('Claude is analyzing your request...');
     } else if (json.type === 'result') {
-      return `⏱️  Duration: ${json.duration_ms}ms | Cost: $${json.total_cost_usd} | Tokens: ${json.usage.input_tokens}in/${json.usage.output_tokens}out`;
+      // Calculate total input tokens (non-cached + cached)
+      const cacheRead = json.usage.cache_read_input_tokens || 0;
+      const cacheCreation = json.usage.cache_creation_input_tokens || 0;
+      const totalCached = cacheRead + cacheCreation;
+      const totalIn = json.usage.input_tokens + totalCached;
+
+      // Show total input tokens with optional cached indicator
+      const tokensDisplay = totalCached > 0
+        ? `${totalIn}in/${json.usage.output_tokens}out (${totalCached} cached)`
+        : `${totalIn}in/${json.usage.output_tokens}out`;
+
+      return `⏱️  Duration: ${json.duration_ms}ms | Cost: $${json.total_cost_usd} | Tokens: ${tokensDisplay}`;
     }
 
     return null;
@@ -68,7 +109,7 @@ function formatStreamJsonLine(line: string): string | null {
 }
 
 export async function runClaude(options: RunClaudeOptions): Promise<RunClaudeResult> {
-  const { prompt, workingDir, model, env, onData, onErrorData, abortSignal, timeout = 1800000 } = options;
+  const { prompt, workingDir, model, env, onData, onErrorData, onTelemetry, abortSignal, timeout = 1800000 } = options;
 
   if (!prompt) {
     throw new Error('runClaude requires a prompt.');
@@ -118,8 +159,11 @@ export async function runClaude(options: RunClaudeOptions): Promise<RunClaudeRes
 
   const { command, args } = buildClaudeExecCommand({ workingDir, prompt, model });
 
-  logger.debug(`Claude runner - prompt length: ${prompt.length}, lines: ${prompt.split('\n').length}`);
-  logger.debug(`Claude runner - args count: ${args.length}, model: ${model ?? 'default'}`);
+  // Debug logging only when LOG_LEVEL=debug
+  if (process.env.LOG_LEVEL === 'debug') {
+    console.error(`[DEBUG] Claude runner - prompt length: ${prompt.length}, lines: ${prompt.split('\n').length}`);
+    console.error(`[DEBUG] Claude runner - args count: ${args.length}, model: ${model ?? 'default'}`);
+  }
 
   // Create telemetry capture instance
   const telemetryCapture = createTelemetryCapture('claude', model, prompt, workingDir);
@@ -145,6 +189,23 @@ export async function runClaude(options: RunClaudeOptions): Promise<RunClaudeRes
             // Capture telemetry data
             telemetryCapture.captureFromStreamJson(line);
 
+            // Emit telemetry event if captured and callback provided
+            if (onTelemetry) {
+              const captured = telemetryCapture.getCaptured();
+              if (captured && captured.tokens) {
+                // tokensIn should be TOTAL input tokens (non-cached + cached)
+                // to match the log output format
+                const totalIn = (captured.tokens.input ?? 0) + (captured.tokens.cached ?? 0);
+                onTelemetry({
+                  tokensIn: totalIn,
+                  tokensOut: captured.tokens.output ?? 0,
+                  cached: captured.tokens.cached,
+                  cost: captured.cost,
+                  duration: captured.duration,
+                });
+              }
+            }
+
             const formatted = formatStreamJsonLine(line);
             if (formatted) {
               onData?.(formatted + '\n');
@@ -169,7 +230,7 @@ export async function runClaude(options: RunClaudeOptions): Promise<RunClaudeRes
       const full = `${command} ${args.join(' ')}`.trim();
       const install = metadata.installCommand;
       const name = metadata.name;
-      logger.error(`${name} CLI not found when executing: ${full}`);
+      console.error(`[ERROR] ${name} CLI not found when executing: ${full}`);
       throw new Error(`'${command}' is not available on this system. Please install ${name} first:\n  ${install}`);
     }
     throw error;
@@ -179,7 +240,7 @@ export async function runClaude(options: RunClaudeOptions): Promise<RunClaudeRes
     const errorOutput = result.stderr.trim() || result.stdout.trim() || 'no error output';
     const lines = errorOutput.split('\n').slice(0, 10);
 
-    logger.error('Claude CLI execution failed', {
+    console.error('[ERROR] Claude CLI execution failed', {
       exitCode: result.exitCode,
       error: lines.join('\n'),
       command: `${command} ${args.join(' ')}`,

@@ -1,16 +1,24 @@
 import * as path from 'node:path';
 import { readFile, mkdir } from 'node:fs/promises';
 import type { WorkflowStep } from '../templates/index.js';
+import { isModuleStep } from '../templates/types.js';
 import type { EngineType } from '../../infra/engines/index.js';
-import { getEngine } from '../../infra/engines/index.js';
 import { processPromptString } from '../../shared/prompts/index.js';
-import { MemoryAdapter } from '../../infra/fs/memory-adapter.js';
-import { MemoryStore } from '../../agents/memory/memory-store.js';
+import { executeAgent } from '../../agents/runner/runner.js';
+import type { WorkflowUIManager } from '../../ui/index.js';
 
 export interface StepExecutorOptions {
   logger: (chunk: string) => void;
   stderrLogger: (chunk: string) => void;
   timeout?: number;
+  ui?: WorkflowUIManager;
+  abortSignal?: AbortSignal;
+  /** Parent agent ID for tracking relationships */
+  parentId?: number;
+  /** Disable monitoring (for special cases) */
+  disableMonitoring?: boolean;
+  /** Unique agent ID for UI updates (includes step index) */
+  uniqueAgentId?: string;
 }
 
 async function ensureProjectScaffold(cwd: string): Promise<void> {
@@ -25,37 +33,22 @@ async function runAgentsBuilderStep(cwd: string): Promise<void> {
 }
 
 /**
- * Ensures the engine is authenticated
- */
-async function ensureEngineAuth(engineType: EngineType): Promise<void> {
-  const { registry } = await import('../../infra/engines/index.js');
-  const engine = registry.get(engineType);
-
-  if (!engine) {
-    const availableEngines = registry.getAllIds().join(', ');
-    throw new Error(
-      `Unknown engine type: ${engineType}. Available engines: ${availableEngines}`
-    );
-  }
-
-  const isAuthed = await engine.auth.isAuthenticated();
-  if (!isAuthed) {
-    console.error(`\n${engine.metadata.name} authentication required`);
-    console.error(`\nRun the following command to authenticate:\n`);
-    console.error(`  codemachine auth login\n`);
-    throw new Error(`${engine.metadata.name} authentication required`);
-  }
-}
-
-/**
  * Executes a workflow step (main agent)
- * Step already has all the data from resolveStep() - no config loading needed
+ *
+ * This is a simplified version that delegates to execution/runner.ts
+ * after building the prompt. No duplication with runner.ts anymore.
  */
 export async function executeStep(
   step: WorkflowStep,
   cwd: string,
   options: StepExecutorOptions,
 ): Promise<string> {
+  // Only module steps can be executed
+  if (!isModuleStep(step)) {
+    throw new Error('Only module steps can be executed');
+  }
+
+  // Load and process the prompt template
   const promptPath = path.isAbsolute(step.promptPath)
     ? step.promptPath
     : path.resolve(cwd, step.promptPath);
@@ -69,62 +62,37 @@ export async function executeStep(
       ? Number.parseInt(process.env.CODEMACHINE_AGENT_TIMEOUT, 10)
       : 1800000);
 
-  // Determine engine: step override > default to first registered engine
-  const { registry } = await import('../../infra/engines/index.js');
-  const defaultEngine = registry.getDefault();
-  if (!defaultEngine) {
-    throw new Error('No engines registered. Please install at least one engine.');
-  }
-  const engineType: EngineType = step.engine ?? defaultEngine.metadata.id;
+  // Determine engine: step override > default
+  const engineType: EngineType | undefined = step.engine;
 
-  // Ensure authentication
-  await ensureEngineAuth(engineType);
-
-  // Get engine and its metadata for defaults
-  const engineModule = registry.get(engineType);
-  if (!engineModule) {
-    throw new Error(`Engine not found: ${engineType}`);
-  }
-  const engine = getEngine(engineType);
-
-  // Model resolution: step override > engine default
-  const model = step.model ?? engineModule.metadata.defaultModel;
-  const modelReasoningEffort = step.modelReasoningEffort ?? engineModule.metadata.defaultModelReasoningEffort;
-
-  // Track stdout for memory storage
-  let totalStdout = '';
-  const result = await engine.run({
-    prompt,
+  // Execute via the unified execution runner
+  // Runner handles: auth, monitoring, engine execution, memory storage
+  const result = await executeAgent(step.agentId, prompt, {
     workingDir: cwd,
-    model,
-    modelReasoningEffort,
-    onData: (chunk) => {
-      totalStdout += chunk;
-      options.logger(chunk);
-    },
-    onErrorData: (chunk) => {
-      options.stderrLogger(chunk);
-    },
+    engine: engineType,
+    model: step.model,
+    logger: options.logger,
+    stderrLogger: options.stderrLogger,
+    onTelemetry: options.ui && options.uniqueAgentId
+      ? (telemetry) => options.ui!.updateAgentTelemetry(options.uniqueAgentId!, telemetry)
+      : undefined,
+    parentId: options.parentId,
+    disableMonitoring: options.disableMonitoring,
+    abortSignal: options.abortSignal,
     timeout,
+    ui: options.ui,
+    uniqueAgentId: options.uniqueAgentId,
   });
 
+  // Run special post-execution steps
   const agentName = step.agentName.toLowerCase();
-
   if (step.agentId === 'agents-builder' || agentName.includes('builder')) {
     await runAgentsBuilderStep(cwd);
   }
 
-  // Save output to memory (write-only, no read)
-  const memoryDir = path.resolve(cwd, '.codemachine', 'memory');
-  const adapter = new MemoryAdapter(memoryDir);
-  const store = new MemoryStore(adapter);
-  const stdout = result.stdout || totalStdout;
-  const slice = stdout.slice(-2000);
-  await store.append({
-    agentId: step.agentId,
-    content: slice,
-    timestamp: new Date().toISOString(),
-  });
+  // NOTE: Telemetry is already updated via onTelemetry callback during streaming execution.
+  // DO NOT parse from final output - it would match the FIRST telemetry line (early/wrong values)
+  // instead of the LAST telemetry line (final/correct values), causing incorrect UI display.
 
-  return result.stdout;
+  return result.output;
 }

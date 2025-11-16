@@ -5,8 +5,9 @@ import { spawnProcess } from '../../../../process/spawn.js';
 import { buildCodexExecCommand } from './commands.js';
 import { metadata } from '../metadata.js';
 import { expandHomeDir } from '../../../../../shared/utils/index.js';
-import { logger } from '../../../../../shared/logging/index.js';
 import { createTelemetryCapture } from '../../../../../shared/telemetry/index.js';
+import type { ParsedTelemetry } from '../../../core/types.js';
+import { formatThinking, formatCommand, formatResult, formatMessage, formatStatus } from '../../../../../shared/formatters/outputMarkers.js';
 
 export interface RunCodexOptions {
   prompt: string;
@@ -16,6 +17,7 @@ export interface RunCodexOptions {
   env?: NodeJS.ProcessEnv;
   onData?: (chunk: string) => void;
   onErrorData?: (chunk: string) => void;
+  onTelemetry?: (telemetry: ParsedTelemetry) => void;
   abortSignal?: AbortSignal;
   timeout?: number; // Timeout in milliseconds (default: 1800000ms = 30 minutes)
 }
@@ -36,33 +38,44 @@ function formatCodexStreamJsonLine(line: string): string | null {
 
     // Handle reasoning items (thinking)
     if (json.type === 'item.completed' && json.item?.type === 'reasoning') {
-      return `🧠 THINKING: ${json.item.text}`;
+      return formatThinking(json.item.text);
     }
 
     // Handle command execution
     if (json.type === 'item.started' && json.item?.type === 'command_execution') {
-      return `🔧 COMMAND: ${json.item.command}`;
+      const command = json.item.command ?? 'command';
+      return formatCommand(command, 'started');
     }
 
     if (json.type === 'item.completed' && json.item?.type === 'command_execution') {
       const exitCode = json.item.exit_code ?? 0;
+      const command = json.item.command;
+
       if (exitCode === 0) {
-        const preview = json.item.aggregated_output
-          ? json.item.aggregated_output.substring(0, 100) + '...'
-          : '';
-        return `✅ COMMAND RESULT: ${preview}`;
+        const output = json.item.aggregated_output?.trim() || '';
+        const preview = output
+          ? (output.length > 100 ? output.substring(0, 100) + '...' : output)
+          : 'empty';
+        // Show command in green with nested result
+        return formatCommand(command, 'success') + '\n' + formatResult(preview, false);
       } else {
-        return `❌ COMMAND FAILED: Exit code ${exitCode}`;
+        // Show command in red with nested error
+        return formatCommand(command, 'error') + '\n' + formatResult(`Exit code ${exitCode}`, true);
       }
     }
 
     // Handle agent messages
     if (json.type === 'item.completed' && json.item?.type === 'agent_message') {
-      return `💬 MESSAGE: ${json.item.text}`;
+      return formatMessage(json.item.text);
     }
 
-    // Handle turn/thread lifecycle events (skip these)
+    // Handle turn/thread lifecycle events
     if (json.type === 'thread.started' || json.type === 'turn.started' || json.type === 'turn.completed') {
+      // Show status message when turn starts
+      if (json.type === 'turn.started') {
+        return formatStatus('Codex is analyzing your request...');
+      }
+
       // Show usage info at turn completion
       if (json.type === 'turn.completed' && json.usage) {
         const { input_tokens, cached_input_tokens, output_tokens } = json.usage;
@@ -79,7 +92,7 @@ function formatCodexStreamJsonLine(line: string): string | null {
 }
 
 export async function runCodex(options: RunCodexOptions): Promise<RunCodexResult> {
-  const { prompt, workingDir, model, modelReasoningEffort, env, onData, onErrorData, abortSignal, timeout = 1800000 } = options;
+  const { prompt, workingDir, model, modelReasoningEffort, env, onData, onErrorData, onTelemetry, abortSignal, timeout = 1800000 } = options;
 
   if (!prompt) {
     throw new Error('runCodex requires a prompt.');
@@ -131,11 +144,14 @@ export async function runCodex(options: RunCodexOptions): Promise<RunCodexResult
 
   const { command, args } = buildCodexExecCommand({ workingDir, prompt, model, modelReasoningEffort });
 
-  logger.debug(`Codex runner - prompt length: ${prompt.length}, lines: ${prompt.split('\n').length}`);
-  logger.debug(`Codex runner - args count: ${args.length}`);
-  logger.debug(
-    `Codex runner - CLI: ${command} ${args.map((arg) => (/\s/.test(arg) ? `"${arg}"` : arg)).join(' ')} | stdin preview: ${prompt.slice(0, 120)}`,
-  );
+  // Debug logging only when LOG_LEVEL=debug
+  if (process.env.LOG_LEVEL === 'debug') {
+    console.error(`[DEBUG] Codex runner - prompt length: ${prompt.length}, lines: ${prompt.split('\n').length}`);
+    console.error(`[DEBUG] Codex runner - args count: ${args.length}`);
+    console.error(
+      `[DEBUG] Codex runner - CLI: ${command} ${args.map((arg) => (/\s/.test(arg) ? `"${arg}"` : arg)).join(' ')} | stdin preview: ${prompt.slice(0, 120)}`,
+    );
+  }
 
   // Create telemetry capture instance
   const telemetryCapture = createTelemetryCapture('codex', model, prompt, workingDir);
@@ -161,6 +177,23 @@ export async function runCodex(options: RunCodexOptions): Promise<RunCodexResult
             // Capture telemetry data
             telemetryCapture.captureFromStreamJson(line);
 
+            // Emit telemetry event if captured and callback provided
+            if (onTelemetry) {
+              const captured = telemetryCapture.getCaptured();
+              if (captured && captured.tokens) {
+                // tokensIn should be TOTAL input tokens (non-cached + cached)
+                // to match the log output format: "13391in/406out (5888 cached)"
+                const totalIn = (captured.tokens.input ?? 0) + (captured.tokens.cached ?? 0);
+                onTelemetry({
+                  tokensIn: totalIn,
+                  tokensOut: captured.tokens.output ?? 0,
+                  cached: captured.tokens.cached,
+                  cost: captured.cost,
+                  duration: captured.duration,
+                });
+              }
+            }
+
             const formatted = formatCodexStreamJsonLine(line);
             if (formatted) {
               onData?.(formatted + '\n');
@@ -185,7 +218,7 @@ export async function runCodex(options: RunCodexOptions): Promise<RunCodexResult
       const full = `${command} ${args.join(' ')}`.trim();
       const install = metadata.installCommand;
       const name = metadata.name;
-      logger.error(`${name} CLI not found when executing: ${full}`);
+      console.error(`[ERROR] ${name} CLI not found when executing: ${full}`);
       throw new Error(`'${command}' is not available on this system. Please install ${name} first:\n  ${install}`);
     }
     throw error;
@@ -195,7 +228,7 @@ export async function runCodex(options: RunCodexOptions): Promise<RunCodexResult
     const errorOutput = result.stderr.trim() || result.stdout.trim() || 'no error output';
     const lines = errorOutput.split('\n').slice(0, 10);
 
-    logger.error('Codex CLI execution failed', {
+    console.error('[ERROR] Codex CLI execution failed', {
       exitCode: result.exitCode,
       error: lines.join('\n'),
       command: `${command} ${args.join(' ')}`,

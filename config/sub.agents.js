@@ -1,53 +1,85 @@
-const path = require('node:path');
-
 module.exports = [
   {
     id: 'uxui-designer',
     name: 'UX/UI Designer',
     description: 'Handle UX and UI design tasks',
-    promptPath: path.join(__dirname, '..', 'prompts', 'ux-ui-designer.md'),
   },
   {
     id: 'frontend-dev',
     name: 'Frontend Developer',
     description: 'Handle frontend development tasks',
-    promptPath: path.join(__dirname, '..', 'prompts', 'frontend-developer.md'),
   },
   {
     id: 'backend-dev',
     name: 'Backend Developer',
     description: 'Handle backend development tasks',
-    promptPath: path.join(__dirname, '..', 'prompts', 'backend-developer.md'),
   },
   {
     id: 'solution-architect',
     name: 'Solution Architect',
     description: 'Handle solution architecture tasks',
-    promptPath: path.join(__dirname, '..', 'prompts', 'solution-architect.md'),
   },
   {
     id: 'technical-writer',
     name: 'Technical Writer / Documentation Specialist',
     description: 'Handle documentation and writing tasks',
-    promptPath: path.join(__dirname, '..', 'prompts', 'technical-writer.md'),
   },
   {
     id: 'qa-engineer',
     name: 'QA/Test Engineer',
     description: 'Handle testing and QA tasks',
-    promptPath: path.join(__dirname, '..', 'prompts', 'qa-test-engineer.md'),
   },
   {
     id: 'performance-engineer',
     name: 'Performance Engineer',
     description: 'Handle performance profiling and optimization tasks',
-    promptPath: path.join(__dirname, '..', 'prompts', 'performance-engineer.md'),
   },
   {
     id: 'software-architect',
     name: 'Software Architect',
-    description:
-      'Handle software architecture planning, directory structure design, and project organization tasks',
-    promptPath: path.join(__dirname, '..', 'prompts', 'software-architect.md'),
+    description: 'Handle software architecture planning, directory structure design, and project organization tasks',
   },
+  {
+    id: 'system-analyst',
+    name: 'System Analyst',
+    description: 'Handle system analysis and requirements gathering tasks',
+  },
+
+  // dev-codemachine sub-agents
+  {
+    id: 'founder-architect',
+    name: 'Founder Architect',
+    description: 'Handle foundational architecture tasks',
+    mirrorPath: 'prompts/templates/dev-codemachine/sub-agents/architecture/01-founder-architect.md',
+  },
+  {
+    id: 'structural-data-architect',
+    name: 'Structural & Data Architect',
+    description: 'Define the static structure of the system, components hierarchy, and data organization',
+    mirrorPath: 'prompts/templates/dev-codemachine/sub-agents/architecture/02-structural-data-architect.md',
+  },
+  {
+    id: 'behavior-architect',
+    name: 'Behavior & Communication Architect',
+    description: 'Define dynamic interactions, data flows, and communication patterns between components',
+    mirrorPath: 'prompts/templates/dev-codemachine/sub-agents/architecture/03-behavior-architect.md',
+  },
+  {
+    id: 'ui-ux-architect',
+    name: 'UI/UX & Interface Architect',
+    description: 'Define user interface architecture, design systems, component hierarchies, and user experience patterns',
+    mirrorPath: 'prompts/templates/dev-codemachine/sub-agents/architecture/05-ui-ux-architect.md',
+  },
+  {
+    id: 'operational-architect',
+    name: 'Operational & Documentation Architect',
+    description: 'Handle deployment, operations, security, and documentation architecture',
+    mirrorPath: 'prompts/templates/dev-codemachine/sub-agents/architecture/04-operational-architect.md',
+  },
+  {
+    id: 'file-assembler',
+    name: 'File Assembler',
+    description: 'Execute commands and create manifest files from architecture outputs',
+    mirrorPath: 'prompts/templates/dev-codemachine/sub-agents/architecture/06-file-assembler.md',
+  }
 ];

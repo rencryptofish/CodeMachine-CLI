@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ModuleBehavior } from '../../templates/index.js';
-import type { BehaviorAction } from '../loop/evaluator.js';
+import type { BehaviorAction } from '../types.js';
 
 export interface TriggerEvaluationOptions {
   behavior?: ModuleBehavior;
@@ -55,6 +55,6 @@ export async function evaluateTriggerBehavior(options: TriggerEvaluationOptions)
     };
   }
 
-  // 'continue', 'loop', 'stop', or unknown action = no trigger behavior
+  // 'continue', 'loop', 'checkpoint', or unknown action = no trigger behavior
   return null;
 }

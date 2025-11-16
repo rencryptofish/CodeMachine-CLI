@@ -2,8 +2,8 @@ import type { Command } from 'commander';
 import * as path from 'node:path';
 
 import { MemoryAdapter } from '../../infra/fs/memory-adapter.js';
-import { MemoryStore } from '../../agents/memory/memory-store.js';
-import { loadAgentTemplate, loadAgentConfig } from '../../agents/execution/index.js';
+import { MemoryStore } from '../../agents/index.js';
+import { loadAgentTemplate, loadAgentConfig } from '../../agents/runner/index.js';
 import { getEngine } from '../../infra/engines/index.js';
 import type { EngineType } from '../../infra/engines/index.js';
 import {
@@ -13,6 +13,7 @@ import {
   stopSpinner,
   createSpinnerLoggers,
 } from '../../shared/logging/index.js';
+import { processPromptString } from '../../shared/prompts/index.js';
 
 type StepCommandOptions = {
   model?: string;
@@ -61,7 +62,8 @@ async function executeStep(
 
   // Load agent config and template
   const agentConfig = await loadAgentConfig(agentId, workingDir);
-  const agentTemplate = await loadAgentTemplate(agentId, workingDir);
+  const rawTemplate = await loadAgentTemplate(agentId, workingDir);
+  const agentTemplate = await processPromptString(rawTemplate, workingDir);
 
   // Determine engine: CLI override > agent config > first authenticated engine
   const { registry } = await import('../../infra/engines/index.js');
@@ -119,10 +121,10 @@ async function executeStep(
   let compositePrompt: string;
   if (additionalPrompt) {
     // If additional prompt provided, append it as a REQUEST section
-    compositePrompt = `[SYSTEM]\n${agentTemplate}\n\n[REQUEST]\n${additionalPrompt}`;
+    compositePrompt = `${agentTemplate}\n\n[REQUEST]\n${additionalPrompt}`;
   } else {
     // If no additional prompt, just use the template
-    compositePrompt = `[SYSTEM]\n${agentTemplate}`;
+    compositePrompt = agentTemplate;
   }
 
   // Get engine and execute
